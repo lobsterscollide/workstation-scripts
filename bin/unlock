@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# unlock — open encrypted source and secrets volumes
+# Usage:
+#   unlock              open both volumes
+#   unlock source       open source only
+#   unlock secrets      open secrets only
+#   unlock status       show current state (no sudo needed)
+#
+# See also: lock
+
+set -euo pipefail
+
+# shellcheck source=../lib/syscheck.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/syscheck.sh"
+
+ENCRYPTED_DIR="/var/encrypted"
+ALL_VOLUMES=(source secrets)
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+is_mounted() { mountpoint -q "/mnt/$1" 2>/dev/null; }
+
+is_open() { sudo cryptsetup status "$1" &>/dev/null; }
+
+print_status() {
+  echo -e "\n${BOLD}${CYAN}Volume status${RESET}"
+  for v in "${ALL_VOLUMES[@]}"; do
+    local img="$ENCRYPTED_DIR/${v}.img"
+    if is_mounted "$v"; then
+      echo -e "  ${GREEN}✓${RESET}  $v  →  /mnt/$v"
+    elif ! losetup -a 2>/dev/null | grep -q "${v}.img"; then
+      echo -e "  ${DIM}–${RESET}  $v  (not set up — run: luks-setup)"
+    else
+      echo -e "  ${DIM}○${RESET}  $v  closed"
+    fi
+  done
+  echo ""
+}
+
+open_volume() {
+  local name="$1"
+  local img="$ENCRYPTED_DIR/${name}.img"
+  local mount="/mnt/${name}"
+
+  if ! sudo test -f "$img"; then
+    err "$name: image not found at $img — run: luks-setup"
+    return 1
+  fi
+
+  if is_mounted "$name"; then
+    ok "$name: already open"
+    return
+  fi
+
+  sudo mkdir -p "$mount"
+
+  if ! is_open "$name"; then
+    info "Unlocking $name — enter passphrase:"
+    sudo cryptsetup luksOpen "$img" "$name"
+  fi
+
+  sudo mount /dev/mapper/"$name" "$mount"
+  sudo chown "$(id -un)":"$(id -gn)" "$mount"
+  ok "$name → /mnt/$name"
+}
+
+info() { echo -e "  ${CYAN}→${RESET}  $1"; }
+
+# ── Parse args ─────────────────────────────────────────────────────────────────
+TARGETS=()
+
+for arg in "$@"; do
+  case "$arg" in
+    source|secrets) TARGETS+=("$arg") ;;
+    status)         print_status; exit 0 ;;
+    *)              echo "Usage: unlock [source|secrets|status]" >&2; exit 1 ;;
+  esac
+done
+
+[[ ${#TARGETS[@]} -eq 0 ]] && TARGETS=("${ALL_VOLUMES[@]}")
+
+# ── Open ───────────────────────────────────────────────────────────────────────
+echo -e "\n${BOLD}${CYAN}Unlocking volumes${RESET}"
+
+for v in "${TARGETS[@]}"; do
+  open_volume "$v"
+done
+
+# Start hardened-api if source was just mounted (in case it is installed there)
+if is_mounted source && ! systemctl is-active --quiet hardened-api; then
+  info "starting hardened-api..."
+  sudo systemctl start hardened-api && ok "hardened-api started"
+fi
+
+print_status

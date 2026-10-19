@@ -1,0 +1,15 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: bash syntax
+        run: for f in $(grep -l '^#!.*bash' bin/*) lib/syscheck.sh; do bash -n "$f"; done
+      - name: shellcheck
+        run: shellcheck -x --source-path=SCRIPTDIR -S warning $(grep -l '^#!.*bash' bin/*) lib/syscheck.sh
+      - name: python syntax
+        run: python3 -m py_compile bin/shortcut

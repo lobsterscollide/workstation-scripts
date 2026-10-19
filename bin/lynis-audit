@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# lynis-audit — run Lynis and copy logs to the central security log directory
+# Usage: lynis-audit [extra lynis options]
+# Logs land in: ~/.local/var/log/security/lynis-TIMESTAMP.log
+#               ~/.local/var/log/security/lynis-TIMESTAMP.report.dat
+
+set -euo pipefail
+
+LOG_DIR="${HOME}/.local/var/log/security"
+mkdir -p "$LOG_DIR" && chmod 700 "$LOG_DIR"
+
+TIMESTAMP="$(date '+%Y-%m-%dT%H:%M:%S')"
+LOG_FILE="${LOG_DIR}/lynis-${TIMESTAMP}.log"
+REPORT_FILE="${LOG_DIR}/lynis-${TIMESTAMP}.report.dat"
+
+echo "Running Lynis audit — logs will be saved to:"
+echo "  ${LOG_FILE}"
+echo "  ${REPORT_FILE}"
+echo ""
+
+sudo lynis audit system "$@"
+
+# Copy the logs Lynis wrote to /var/log into our central dir
+[[ -f /var/log/lynis.log ]]        && sudo cp /var/log/lynis.log "$LOG_FILE"        && sudo chown "$(id -un)" "$LOG_FILE" && sudo chmod 600 "$LOG_FILE"
+[[ -f /var/log/lynis-report.dat ]] && sudo cp /var/log/lynis-report.dat "$REPORT_FILE" && sudo chown "$(id -un)" "$REPORT_FILE" && sudo chmod 600 "$REPORT_FILE"
+
+echo ""
+echo "Logs saved:"
+echo "  $(ls -lh "$LOG_FILE" 2>/dev/null || echo '  (log not found)')"
+echo "  $(ls -lh "$REPORT_FILE" 2>/dev/null || echo '  (report not found)')"

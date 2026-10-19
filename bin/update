@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# update — system and runtime maintenance
+# Run when ready. Takes 15-30 min. Keep an eye on it.
+
+set -euo pipefail
+# shellcheck source=../lib/syscheck.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/syscheck.sh"
+# shellcheck disable=SC2034  # read by progress() in syscheck.sh
+TOTAL_STEPS=7
+
+# ── 1. System packages ────────────────────────────────────────────────────────
+progress "System packages (pacman -Syu)"
+
+if sudo pacman -Syu; then
+  ok "System up to date"
+else
+  err "pacman -Syu failed — check output above"
+  note "System update failed — run: sudo pacman -Syu"
+fi
+
+# ── 2. Hardened kernel boot check ────────────────────────────────────────────
+# linux-hardened trails linux by a few days on major releases. When it catches
+# up, we want to boot it automatically — it has additional security patches the
+# standard kernel lacks. We also re-apply this after every kernel upgrade since
+# pacman hooks regenerate limine.conf and reset default_entry to linux (standard).
+progress "Hardened kernel boot check"
+
+_LINUX_VER=$(pacman -Q linux 2>/dev/null | awk '{print $2}' || true)
+_HARDENED_VER=$(pacman -Q linux-hardened 2>/dev/null | awk '{print $2}' || true)
+
+if [[ -z "$_LINUX_VER" || -z "$_HARDENED_VER" ]]; then
+  warn "Cannot compare kernel versions — linux or linux-hardened not installed"
+else
+  # Compare the kernel version number only (strip .archN-N and .hardenedN-N suffixes)
+  _LINUX_KVER=$(echo "$_LINUX_VER" | sed 's/\.arch.*//')
+  _HARDENED_KVER=$(echo "$_HARDENED_VER" | sed 's/\.hardened.*//')
+
+  # Find which entry number //linux-hardened occupies in the Limine menu.
+  # Entry numbering: /+ groups and // entries each count as one menu item.
+  # Typical layout: /+Omarchy=1, //linux=2, //linux-hardened=3
+  _HARDENED_ENTRY=$(awk '
+    /^[[:space:]]*\/[+\/]/ { count++ }
+    /^[[:space:]]*\/\/linux-hardened/ { found=1; exit }
+    END { if (found) print count }
+  ' /boot/limine.conf 2>/dev/null || true)
+
+  _CURRENT_DEFAULT=$(awk '/^default_entry:/ {print $2}' /boot/limine.conf 2>/dev/null || true)
+
+  if [[ "$_LINUX_KVER" == "$_HARDENED_KVER" ]]; then
+    if [[ -z "$_HARDENED_ENTRY" ]]; then
+      warn "linux-hardened entry not found in /boot/limine.conf — check manually"
+    elif [[ "$_CURRENT_DEFAULT" == "$_HARDENED_ENTRY" ]]; then
+      ok "Booting linux-hardened $_HARDENED_VER (Limine entry $_CURRENT_DEFAULT)"
+    else
+      # Versions match but bootloader still defaults to standard — fix it
+      if sudo sed -i "s/^default_entry: .*/default_entry: $_HARDENED_ENTRY/" /boot/limine.conf; then
+        ok "linux-hardened $_HARDENED_VER = linux $_LINUX_VER — bootloader default updated to entry $_HARDENED_ENTRY"
+        warn "Reboot to start running linux-hardened"
+      else
+        err "Failed to update /boot/limine.conf — fix manually: sudo sed -i 's/^default_entry: .*/default_entry: $_HARDENED_ENTRY/' /boot/limine.conf"
+      fi
+    fi
+  else
+    warn "linux-hardened ($_HARDENED_VER) behind linux ($_LINUX_VER) — booting standard kernel until it catches up"
+  fi
+fi
+unset _LINUX_VER _HARDENED_VER _LINUX_KVER _HARDENED_KVER _HARDENED_ENTRY _CURRENT_DEFAULT
+
+# ── 3. CVE check (post-update) ───────────────────────────────────────────────
+progress "CVE check (arch-audit)"
+
+if ! command -v arch-audit &>/dev/null; then
+  warn "arch-audit not installed — run: curl -X POST ... system.install_arch_audit via hardened-api"
+else
+  AA_OUT=$(arch-audit 2>&1) || true
+  if [[ -z "$AA_OUT" ]]; then
+    ok "No vulnerable packages"
+  else
+    while IFS= read -r line; do warn "CVE: $line"; done <<< "$AA_OUT"
+  fi
+fi
+
+# ── 4. AV signatures ─────────────────────────────────────────────────────────
+progress "AV signatures (freshclam)"
+
+if ! command -v freshclam &>/dev/null; then
+  warn "freshclam not installed — install clamav"
+elif systemctl is-active --quiet clamav-freshclam.service; then
+  ok "Signatures managed by clamav-freshclam.service (daemon running)"
+else
+  echo -e "  ${DIM}Updating ClamAV signatures...${RESET}"
+  FCLAM_OUT=$(sudo freshclam 2>&1) || true
+  if echo "$FCLAM_OUT" | grep -qE "^ERROR"; then
+    echo "$FCLAM_OUT" | grep -E "^(ERROR|WARNING)" | sed 's/^/  /'
+    warn "freshclam had errors — check output above"
+  else
+    ok "Signatures updated"
+  fi
+fi
+
+# ── 5. Rkhunter baseline refresh ──────────────────────────────────────────────
+progress "Rkhunter baseline (propupd)"
+
+if ! command -v rkhunter &>/dev/null; then
+  warn "rkhunter not installed"
+else
+  echo -e "  ${DIM}Refreshing file properties database...${RESET}"
+  if sudo rkhunter --propupd &>/dev/null; then
+    ok "rkhunter baseline refreshed"
+  else
+    warn "rkhunter --propupd failed — check: sudo rkhunter --propupd"
+  fi
+fi
+
+# ── 6. AIDE baseline refresh ─────────────────────────────────────────────────
+progress "AIDE baseline (post-update)"
+
+if ! command -v aide &>/dev/null; then
+  warn "aide not installed — skipping integrity baseline refresh"
+else
+  # Detect whether the kernel package changed this update by comparing
+  # the running kernel to the installed package version.
+  RUNNING_KERNEL=$(uname -r)
+  INSTALLED_KERNEL=$(pacman -Q linux 2>/dev/null | awk '{print $2}' || echo "")
+  # Kernel version format: installed=6.12.1.arch1-1, running=6.12.1-arch1-1
+  # Normalise by replacing first dash with dot for comparison
+  INSTALLED_NORM=$(echo "$INSTALLED_KERNEL" | sed 's/-/./1')
+  RUNNING_NORM=$(echo "$RUNNING_KERNEL" | sed 's/-arch/.arch/;s/-/./g')
+
+  if [[ "$RUNNING_NORM" != "$INSTALLED_NORM"* ]]; then
+    warn "Kernel updated (running: $RUNNING_KERNEL, installed: $INSTALLED_KERNEL) — AIDE baseline needs refresh after reboot"
+    note "Reboot, then apply: fint.update_aide_db via hardened-api"
+  else
+    # Even without a kernel change, refresh the baseline via the API.
+    if systemctl is-active --quiet hardened-api; then
+      echo -e "  ${DIM}Refreshing AIDE baseline via hardened-api...${RESET}"
+      AIDE_RESP=$(curl -sf -X POST -H @- \
+        -H "Content-Type: application/json" \
+        -H "X-Harden-Confirm: yes" \
+        -d '{"actions":["fint.update_aide_db"]}' \
+        "${HARDENED_API_URL}/api/v1/harden" \
+        <<<"Authorization: Bearer ${HARDENED_API_HARDEN_KEY:-${HARDENED_API_KEY:-}}" 2>/dev/null) || true
+      if echo "$AIDE_RESP" | python3 -c "import sys,json; sys.exit(0 if json.load(sys.stdin)['actions'][0]['applied'] else 1)" 2>/dev/null; then
+        ok "AIDE baseline refreshed"
+      else
+        warn "AIDE baseline refresh via API failed — run manually: fint.update_aide_db"
+        note "AIDE baseline may be stale — apply: fint.update_aide_db"
+      fi
+    else
+      warn "hardened-api not running — AIDE baseline not refreshed"
+      note "Start hardened-api, then apply: fint.update_aide_db"
+    fi
+  fi
+fi
+
+# ── 7. Runtime versions (mise) ────────────────────────────────────────────────
+progress "Runtime versions (mise)"
+
+if ! command -v mise &>/dev/null; then
+  warn "mise not installed — skipping runtime updates"
+else
+  echo -e "  ${DIM}Checking mise plugins...${RESET}"
+  OUTDATED=$(mise outdated 2>/dev/null || true)
+  if [[ -z "$OUTDATED" ]]; then
+    ok "All runtimes up to date"
+  else
+    echo "$OUTDATED" | sed 's/^/  /'
+    warn "Outdated runtimes above — run: mise upgrade"
+    note "Outdated mise runtimes — run: mise upgrade"
+  fi
+fi
+
+summary

@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# startup — fast session health check (<1 min)
+# Run at the start of every session.
+
+set -euo pipefail
+# shellcheck source=../lib/syscheck.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/syscheck.sh"
+# shellcheck disable=SC2034  # read by progress() in syscheck.sh
+TOTAL_STEPS=5
+
+# ── 1. Boot health ────────────────────────────────────────────────────────────
+progress "Boot health"
+
+FAILED=$(systemctl --failed --plain --no-legend --no-pager 2>/dev/null | awk '{print $1}' | tr '\n' ' ')
+if [[ -n "$FAILED" ]]; then
+  err "Failed units: $FAILED"
+  note "Failed systemd units — run: systemctl --failed"
+else
+  ok "No failed systemd units"
+fi
+
+# ── 2. NymVPN ─────────────────────────────────────────────────────────────────
+progress "NymVPN"
+
+if ip link show tun0 &>/dev/null && ip addr show tun0 2>/dev/null | grep -q "inet "; then
+  VPN_IP=$(ip addr show tun0 | awk '/inet / {print $2}')
+  ok "Connected ($VPN_IP)"
+else
+  warn "Not connected — connect NymVPN before proceeding"
+fi
+
+# ── 3. Pending updates ────────────────────────────────────────────────────────
+progress "Pending updates"
+
+if ! command -v checkupdates &>/dev/null; then
+  warn "checkupdates not available — install pacman-contrib for update counts"
+else
+  UPDATE_COUNT=$(checkupdates 2>/dev/null | wc -l || true)
+  if [[ "$UPDATE_COUNT" -eq 0 ]]; then
+    ok "System up to date"
+  else
+    warn "$UPDATE_COUNT update(s) available — run: update"
+  fi
+fi
+
+# ── 4. Security posture ───────────────────────────────────────────────────────
+progress "Security posture"
+
+if ! systemctl is-active --quiet hardened-api; then
+  err "hardened-api is not running — run: sudo systemctl start hardened-api"
+else
+  API_OUT=$(curl -sf -H @- "${HARDENED_API_URL}/api/v1/checks" <<<"Authorization: Bearer ${HARDENED_API_KEY:-}" 2>/dev/null) || true
+  if [[ -z "$API_OUT" ]]; then
+    err "hardened-api unreachable — check: sudo journalctl -u hardened-api"
+  else
+    echo "$API_OUT" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+actionable = []
+cve_noise = []
+for r in data['results']:
+    if not r['ok'] and r.get('findings'):
+        for f in r['findings']:
+            if f.get('remediation','').startswith('No fix available'):
+                cve_noise.append(f['title'])
+            else:
+                actionable.append(f\"  {f['id']}: {f['title']}\")
+if actionable:
+    print('ACTIONABLE')
+    for a in actionable: print(a)
+elif cve_noise:
+    print(f'NOISE {len(cve_noise)}')
+else:
+    print('CLEAN')
+" 2>/dev/null | {
+      read -r status rest
+      case "$status" in
+        CLEAN)  ok "All checks clean" ;;
+        NOISE)  ok "All checks clean ($rest CVE(s) with no upstream fix — run audit for details)" ;;
+        ACTIONABLE)
+          warn "Actionable findings:"
+          while IFS= read -r line; do warn "$line"; done
+          note "Hardened-API findings need attention — run: audit"
+          ;;
+      esac
+    }
+  fi
+fi
+
+# ── 5. Encrypted volumes ──────────────────────────────────────────────────────
+progress "Encrypted volumes"
+
+for vol in source secrets; do
+  if mountpoint -q "/mnt/$vol" 2>/dev/null; then
+    ok "$vol: open → /mnt/$vol"
+  elif losetup -a 2>/dev/null | grep -q "${vol}.img"; then
+    note "$vol: closed — run: unlock $vol"
+    echo -e "  ${DIM}○${RESET}  $vol: closed"
+  else
+    warn "$vol: not set up — run: luks-setup"
+  fi
+done
+
+summary

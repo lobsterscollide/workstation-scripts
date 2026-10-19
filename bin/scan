@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# scan — targeted security scan (~5-10 min)
+# Covers the highest-risk paths. Run frequently or after anything suspicious.
+# For a full filesystem scan before pushing code to other machines, run: fullscan
+
+set -euo pipefail
+# shellcheck source=../lib/syscheck.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/syscheck.sh"
+# shellcheck disable=SC2034  # read by progress() in syscheck.sh
+TOTAL_STEPS=6
+init_log scan
+
+# ── 1. Rkhunter ───────────────────────────────────────────────────────────────
+progress "Rootkit scan (rkhunter)"
+
+if ! command -v rkhunter &>/dev/null; then
+  warn "rkhunter not installed"
+else
+  echo -e "  ${DIM}Scanning...${RESET}"
+  RKH_OUT=$(sudo rkhunter --check --skip-keypress --report-warnings-only 2>&1) || true
+  WARNINGS=$(echo "$RKH_OUT" | grep -E "^\[ *Warning\]|Warning:" || true)
+  if [[ -z "$WARNINGS" ]]; then
+    ok "No warnings"
+  else
+    while IFS= read -r line; do warn "rkhunter: $line"; done <<< "$WARNINGS"
+  fi
+fi
+
+# ── 2. Chkrootkit ─────────────────────────────────────────────────────────────
+progress "Rootkit scan (chkrootkit)"
+
+if ! command -v chkrootkit &>/dev/null; then
+  warn "chkrootkit not installed — apply services.install_chkrootkit via hardened-api"
+else
+  echo -e "  ${DIM}Scanning...${RESET}"
+  CRK_OUT=$(sudo chkrootkit 2>&1) || true
+  INFECTED=$(echo "$CRK_OUT" | grep "INFECTED" || true)
+  if [[ -z "$INFECTED" ]]; then
+    ok "No infections found"
+  else
+    while IFS= read -r line; do err "chkrootkit: $line"; done <<< "$INFECTED"
+  fi
+fi
+
+# ── 3. ClamAV — targeted ──────────────────────────────────────────────────────
+progress "Malware scan (clamscan — targeted)"
+
+if ! command -v clamscan &>/dev/null; then
+  warn "clamscan not installed — install clamav"
+else
+  SCAN_DIRS=(/etc /tmp /var/tmp "$HOME/Work")
+  echo -e "  ${DIM}Scanning: ${SCAN_DIRS[*]}${RESET}"
+  CLAM_OUT=$(clamscan -r --quiet --infected "${SCAN_DIRS[@]}" 2>/dev/null) || true
+  if [[ -z "$CLAM_OUT" ]]; then
+    ok "No threats found"
+  else
+    while IFS= read -r line; do err "clamscan: $line"; done <<< "$CLAM_OUT"
+  fi
+fi
+
+# ── 4. AIDE integrity check ───────────────────────────────────────────────────
+progress "File integrity (AIDE)"
+
+if ! command -v aide &>/dev/null; then
+  warn "aide not installed — run: POST fint.install_aide via hardened-api"
+elif [[ ! -f /var/lib/aide/aide.db.gz ]]; then
+  warn "AIDE database not initialised — run: sudo aide --init"
+else
+  echo -e "  ${DIM}Checking file integrity...${RESET}"
+  AIDE_OUT=$(sudo aide --check 2>&1) || true
+  CHANGES=$(echo "$AIDE_OUT" | grep -E "^(Added|Removed|Changed|f\+)" | head -20 || true)
+  if [[ -z "$CHANGES" ]]; then
+    ok "No integrity violations"
+  else
+    while IFS= read -r line; do warn "AIDE: $line"; done <<< "$CHANGES"
+  fi
+fi
+
+# ── 5. SUID/SGID audit ────────────────────────────────────────────────────────
+progress "SUID/SGID binaries"
+
+SUID_OUT=$(find /usr/bin /usr/sbin /bin /sbin -perm /6000 2>/dev/null | sort)
+SUID_COUNT=$(echo "$SUID_OUT" | grep -c . || true)
+# Expected on Arch: standard system tools + PAM helpers + FUSE + locate
+KNOWN_SUID="/usr/bin/sudo /usr/bin/su /usr/bin/passwd /usr/bin/newgrp /usr/bin/gpasswd /usr/bin/chsh /usr/bin/chfn /usr/bin/mount /usr/bin/umount /usr/sbin/pam_timestamp_check /usr/bin/chage /usr/bin/expiry /usr/bin/fusermount /usr/bin/fusermount3 /usr/bin/groupmems /usr/bin/sg /usr/bin/unix_chkpwd /usr/bin/plocate /usr/bin/op"
+# Unnecessary on a hardened server — hardened-api action: suid.remove_unnecessary
+REMOVABLE_SUID="/usr/bin/ksu /usr/bin/mount.cifs /usr/bin/pkexec /usr/bin/wall /usr/bin/write"
+UNEXPECTED=""
+while IFS= read -r bin; do
+  if ! echo "$KNOWN_SUID $REMOVABLE_SUID" | grep -qF "$bin"; then
+    UNEXPECTED+="$bin"$'\n'
+  fi
+done <<< "$SUID_OUT"
+
+REMOVABLE_FOUND=""
+for bin in $REMOVABLE_SUID; do
+  if echo "$SUID_OUT" | grep -qF "$bin"; then
+    REMOVABLE_FOUND+="$bin"$'\n'
+  fi
+done
+
+if [[ -z "$UNEXPECTED" ]] && [[ -z "$REMOVABLE_FOUND" ]]; then
+  ok "$SUID_COUNT SUID/SGID binaries — all expected"
+else
+  if [[ -n "$REMOVABLE_FOUND" ]]; then
+    while IFS= read -r line; do [[ -n "$line" ]] && warn "unnecessary SUID (apply suid.remove_unnecessary): $line"; done <<< "$REMOVABLE_FOUND"
+  fi
+  if [[ -n "$UNEXPECTED" ]]; then
+    while IFS= read -r line; do [[ -n "$line" ]] && warn "unexpected SUID — manual review: $line"; done <<< "$UNEXPECTED"
+  fi
+  note "Unexpected SUID/SGID binaries — review above"
+fi
+
+# ── 6. SSH key review ─────────────────────────────────────────────────────────
+progress "SSH keys"
+
+AUTH_KEYS="$HOME/.ssh/authorized_keys"
+if [[ ! -f "$AUTH_KEYS" ]]; then
+  ok "No authorized_keys file"
+else
+  AK_COUNT=$(grep -c . "$AUTH_KEYS" 2>/dev/null || echo 0)
+  warn "$AK_COUNT key(s) in authorized_keys — verify each is intentional"
+  note "Review ~/.ssh/authorized_keys ($AK_COUNT entries)"
+fi
+
+KH_COUNT=$(grep -c . "$HOME/.ssh/known_hosts" 2>/dev/null || echo 0)
+ok "$KH_COUNT known hosts on record"
+
+summary
+
+echo -e "${DIM}For a full filesystem scan before pushing code to other machines, run: fullscan${RESET}\n"

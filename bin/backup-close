@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# backup-close — unmount and lock the backup drive
+
+set -euo pipefail
+
+MAPPER_NAME="backup"
+MOUNT_POINT="/mnt/backup"
+
+if mountpoint -q "$MOUNT_POINT" 2>/dev/null; then
+    echo "unmounting ${MOUNT_POINT}..."
+    sudo umount "$MOUNT_POINT"
+else
+    echo "${MOUNT_POINT} not mounted"
+fi
+
+if [ -e "/dev/mapper/${MAPPER_NAME}" ]; then
+    echo "closing LUKS container..."
+    sudo cryptsetup close "$MAPPER_NAME"
+    echo "backup drive locked"
+else
+    echo "LUKS container already closed"
+fi

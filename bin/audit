@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# audit — deep pre-engagement / quarterly security audit
+# Run before connecting to any new client system, server, or quarterly.
+# Takes ~30-60 min.
+
+set -euo pipefail
+# shellcheck source=../lib/syscheck.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/syscheck.sh"
+# shellcheck disable=SC2034  # read by progress() in syscheck.sh
+TOTAL_STEPS=6
+
+echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗"
+echo -e "║  SECURITY AUDIT — $(date '+%Y-%m-%d %H:%M')       ║"
+echo -e "╚══════════════════════════════════════════╝${RESET}"
+
+# ── 1. Lynis ──────────────────────────────────────────────────────────────────
+progress "Full Lynis audit"
+
+if ! command -v lynis &>/dev/null; then
+  err "lynis not installed — install: sudo pacman -S lynis"
+else
+  echo -e "  ${DIM}Running full system audit (this takes a few minutes)...${RESET}"
+  sudo lynis audit system --quiet --no-colors 2>/dev/null || true
+  SCORE=$(grep "^hardening_index=" /var/log/lynis-report.dat 2>/dev/null | cut -d= -f2 || echo "unknown")
+  WARNINGS=$(grep "^warning\[\]=" /var/log/lynis-report.dat 2>/dev/null | wc -l || echo 0)
+  SUGGESTIONS=$(grep "^suggestion\[\]=" /var/log/lynis-report.dat 2>/dev/null | wc -l || echo 0)
+  if [[ "$SCORE" != "unknown" && -n "$SCORE" ]]; then
+    ok "Hardening index: $SCORE  |  Warnings: $WARNINGS  |  Suggestions: $SUGGESTIONS"
+    [[ "$WARNINGS" -gt 0 ]] && warn "$WARNINGS Lynis warnings — check: sudo lynis audit system"
+  else
+    warn "Could not parse Lynis score — run manually: sudo lynis audit system"
+  fi
+fi
+
+# ── 2. Full ClamAV scan ───────────────────────────────────────────────────────
+progress "Full malware scan (clamscan)"
+
+if ! command -v clamscan &>/dev/null; then
+  warn "clamscan not installed — install clamav"
+else
+  echo -e "  ${DIM}Full home directory scan...${RESET}"
+  CLAM_OUT=$(clamscan -r --quiet --infected "$HOME" /etc /tmp /var/tmp 2>/dev/null) || true
+  if [[ -z "$CLAM_OUT" ]]; then
+    ok "No threats found"
+  else
+    while IFS= read -r line; do err "clamscan: $line"; done <<< "$CLAM_OUT"
+  fi
+fi
+
+# ── 3. Credential exposure ────────────────────────────────────────────────────
+progress "Credential exposure"
+
+ISSUES=0
+
+# Check for plaintext private keys outside .ssh
+STRAY_KEYS=$(grep -rl "BEGIN.*PRIVATE KEY" "$HOME" \
+  --include="*.txt" --include="*.md" --include="*.json" \
+  --include="*.env" --include="*.conf" --include="*.yaml" --include="*.yml" \
+  2>/dev/null | grep -v ".ssh/" || true)
+if [[ -n "$STRAY_KEYS" ]]; then
+  while IFS= read -r f; do err "Private key found outside .ssh: $f"; done <<< "$STRAY_KEYS"
+  ISSUES=$((ISSUES+1))
+fi
+
+# Check for .env files with secrets
+ENV_FILES=$(find "$HOME/Work" -name ".env" -not -path "*/node_modules/*" 2>/dev/null || true)
+if [[ -n "$ENV_FILES" ]]; then
+  COUNT=$(echo "$ENV_FILES" | grep -c . || true)
+  warn "$COUNT .env file(s) in Work/ — ensure none contain production credentials"
+fi
+
+# Check .ssh permissions
+if [[ -d "$HOME/.ssh" ]]; then
+  SSH_DIR_PERMS=$(stat -c "%a" "$HOME/.ssh")
+  [[ "$SSH_DIR_PERMS" != "700" ]] && warn ".ssh dir permissions are $SSH_DIR_PERMS (should be 700)" && ISSUES=$((ISSUES+1))
+fi
+
+[[ $ISSUES -eq 0 ]] && ok "No exposed credentials found"
+
+# ── 4. Listening services ─────────────────────────────────────────────────────
+progress "Listening services"
+
+echo -e "  ${DIM}Active listeners:${RESET}"
+ss -tlnp 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+  echo -e "  ${DIM}$line${RESET}"
+done
+
+EXTERNAL=$(ss -tlnp 2>/dev/null | grep -v "127\.\|::1\|\*:0\|172\.17\." | tail -n +2 || true)
+if [[ -z "$EXTERNAL" ]]; then
+  ok "No externally-exposed listeners"
+else
+  while IFS= read -r line; do warn "External listener: $line"; done <<< "$EXTERNAL"
+  note "Review externally-exposed listeners above"
+fi
+
+# ── 5. Hardened API full check ────────────────────────────────────────────────
+progress "Hardened API — full posture check"
+
+if ! systemctl is-active --quiet hardened-api; then
+  err "hardened-api not running"
+else
+  API_OUT=$(curl -sf -H @- "${HARDENED_API_URL}/api/v1/checks" <<<"Authorization: Bearer ${HARDENED_API_KEY:-}" 2>/dev/null) || true
+  if [[ -z "$API_OUT" ]]; then
+    err "hardened-api unreachable"
+  else
+    SEVERITY=$(echo "$API_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['overall_severity'])" 2>/dev/null || echo "unknown")
+    FAILING=$(echo "$API_OUT" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+count = sum(1 for r in data['results'] if not r['ok'])
+print(count)
+" 2>/dev/null || echo "?")
+    if [[ "$FAILING" -eq 0 ]]; then
+      ok "All checks clean (severity: $SEVERITY)"
+    else
+      warn "$FAILING check(s) failing (severity: $SEVERITY)"
+      echo "$API_OUT" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for r in data['results']:
+    if not r['ok'] and r.get('findings'):
+        for f in r['findings']:
+            print(f\"    {f['id']}: {f['title']} — {f['description']}\")
+" 2>/dev/null
+    fi
+  fi
+fi
+
+# ── 6. Package delta ──────────────────────────────────────────────────────────
+progress "Package delta (explicit installs)"
+
+EXPLICIT=$(pacman -Qe 2>/dev/null | wc -l || echo "?")
+FOREIGN=$(pacman -Qm 2>/dev/null | wc -l || echo 0)
+ok "$EXPLICIT explicit packages  |  $FOREIGN AUR/foreign packages"
+
+if [[ "$FOREIGN" -gt 0 ]]; then
+  echo -e "  ${DIM}Foreign packages:${RESET}"
+  pacman -Qm 2>/dev/null | sed 's/^/    /'
+fi
+
+if command -v arch-audit &>/dev/null; then
+  AA_OUT=$(arch-audit 2>&1) || true
+  if [[ -n "$AA_OUT" ]]; then
+    while IFS= read -r line; do warn "CVE: $line"; done <<< "$AA_OUT"
+    note "Vulnerable packages found — run: update"
+  fi
+fi
+
+summary
+
+echo -e "${DIM}Full Lynis report: sudo lynis show report${RESET}"
+echo -e "${DIM}Full hardened-api plan: curl -s -H 'Authorization: Bearer \$HARDENED_API_KEY' ${HARDENED_API_URL}/api/v1/plan | python3 -m json.tool${RESET}\n"

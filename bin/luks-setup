@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# luks-setup — one-time creation of encrypted source and secrets volumes
+# Run once. After completion, use `unlock` / `lock` for daily use.
+#
+# Creates:
+#   /var/encrypted/source.img   50G  → mounts at /mnt/source
+#   /var/encrypted/secrets.img   2G  → mounts at /mnt/secrets
+
+set -euo pipefail
+
+BOLD='\033[1m'
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+RESET='\033[0m'
+
+info()    { echo -e "${CYAN}→${RESET}  $1"; }
+ok()      { echo -e "${GREEN}✓${RESET}  $1"; }
+warn()    { echo -e "${YELLOW}⚠${RESET}  $1"; }
+die()     { echo -e "${RED}✗${RESET}  $1" >&2; exit 1; }
+heading() { echo -e "\n${BOLD}${CYAN}━━ $1 ━━${RESET}"; }
+
+# ── Preflight ──────────────────────────────────────────────────────────────────
+heading "Preflight"
+
+[[ $EUID -ne 0 ]] || die "Do not run as root — run as your normal user, script uses sudo internally"
+
+command -v cryptsetup &>/dev/null || die "cryptsetup not found — install: sudo pacman -S cryptsetup"
+command -v mkfs.ext4  &>/dev/null || die "mkfs.ext4 not found — install: sudo pacman -S e2fsprogs"
+
+ENCRYPTED_DIR="/var/encrypted"
+
+if [[ -f "$ENCRYPTED_DIR/source.img" || -f "$ENCRYPTED_DIR/secrets.img" ]]; then
+  warn "Volume images already exist in $ENCRYPTED_DIR"
+  warn "Re-running will overwrite them. All data will be lost."
+  echo
+  read -r -p "Type YES to continue: " confirm
+  [[ "$confirm" == "YES" ]] || { info "Aborted."; exit 0; }
+fi
+
+sudo mkdir -p "$ENCRYPTED_DIR"
+sudo chmod 700 "$ENCRYPTED_DIR"
+ok "Encrypted storage dir: $ENCRYPTED_DIR"
+
+# ── Helper ─────────────────────────────────────────────────────────────────────
+create_volume() {
+  local name="$1"
+  local size="$2"
+  local img="$ENCRYPTED_DIR/${name}.img"
+  local mount="/mnt/${name}"
+
+  heading "$name ($size)"
+
+  info "Allocating image..."
+  sudo fallocate -l "$size" "$img"
+  sudo chmod 600 "$img"
+  ok "Image: $img"
+
+  info "Formatting LUKS2 — you will be prompted to set a passphrase"
+  sudo cryptsetup luksFormat --type luks2 --pbkdf argon2id "$img"
+  ok "LUKS2 formatted"
+
+  info "Opening to create filesystem..."
+  sudo cryptsetup luksOpen "$img" "$name"
+  sudo mkfs.ext4 -q -L "$name" /dev/mapper/"$name"
+  ok "ext4 filesystem created (label: $name)"
+
+  sudo mkdir -p "$mount"
+  sudo mount /dev/mapper/"$name" "$mount"
+  sudo chown "$(id -un)":"$(id -gn)" "$mount"
+  sudo chmod 700 "$mount"
+  ok "Mounted at $mount (owned by $(id -un))"
+
+  sudo umount "$mount"
+  sudo cryptsetup luksClose "$name"
+  ok "Closed — use \`unlock $name\` to open"
+}
+
+# ── Create volumes ─────────────────────────────────────────────────────────────
+create_volume source  50G
+create_volume secrets  2G
+
+# ── Done ───────────────────────────────────────────────────────────────────────
+heading "Done"
+ok "source  → /mnt/source   (50G)"
+ok "secrets → /mnt/secrets  (2G)"
+echo
+echo -e "${BOLD}Next steps:${RESET}"
+echo "  1. Run: unlock"
+echo "  2. Move your work:  mv ~/Work/* /mnt/source/"
+echo "  3. Update symlink:  ln -s /mnt/source ~/Work-encrypted"
+echo "     (or update paths in CLAUDE.md / shell config)"
+echo
+warn "Remember: both volumes must be unlocked before starting a dev session"
+echo ""

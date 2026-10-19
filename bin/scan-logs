@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# scan-logs — browse and tail security scan logs
+# Usage:
+#   scan-logs          — list all logs, newest first
+#   scan-logs tail     — tail the most recent log
+#   scan-logs tail N   — tail the Nth most recent log (1 = newest)
+#   scan-logs cat N    — print full log N
+#   scan-logs grep PATTERN  — grep across all logs
+
+set -euo pipefail
+
+LOG_DIR="${HOME}/.local/var/log/security"
+
+if [[ ! -d "$LOG_DIR" ]] || [[ -z "$(ls -A "$LOG_DIR" 2>/dev/null)" ]]; then
+  echo "No scan logs yet. Run: scan, fullscan, or lynis-audit"
+  exit 0
+fi
+
+cmd="${1:-list}"
+n="${2:-1}"
+
+mapfile -t logs < <(ls -t "$LOG_DIR"/*.log 2>/dev/null)
+
+case "$cmd" in
+  list)
+    echo "Security scan logs (${#logs[@]} total) — ${LOG_DIR}"
+    echo ""
+    printf "  %-4s  %-12s  %s\n" "#" "Size" "File"
+    printf "  %-4s  %-12s  %s\n" "----" "------------" "----"
+    i=1
+    for f in "${logs[@]}"; do
+      size=$(du -sh "$f" 2>/dev/null | cut -f1)
+      printf "  %-4s  %-12s  %s\n" "$i" "$size" "$(basename "$f")"
+      ((i++))
+    done
+    echo ""
+    echo "Usage: scan-logs tail [N]  |  scan-logs cat [N]  |  scan-logs grep PATTERN"
+    ;;
+  tail)
+    f="${logs[$((n-1))]}"
+    echo "==> $(basename "$f") <=="
+    tail -50 "$f"
+    ;;
+  cat)
+    f="${logs[$((n-1))]}"
+    echo "==> $(basename "$f") <=="
+    cat "$f"
+    ;;
+  grep)
+    pattern="${2:?Usage: scan-logs grep PATTERN}"
+    grep -l "$pattern" "${logs[@]}" 2>/dev/null | while read -r f; do
+      echo "==> $(basename "$f") <=="
+      grep --color=always "$pattern" "$f"
+      echo ""
+    done
+    ;;
+  *)
+    echo "Usage: scan-logs [list|tail [N]|cat [N]|grep PATTERN]"
+    exit 1
+    ;;
+esac

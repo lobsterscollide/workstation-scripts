@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# backup-run — restic backup of this workstation to the local backup drive
+# Backs up: /mnt/source, /mnt/secrets, /etc
+# Run after: backup-open
+
+set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "re-running as root (needed to read /etc/shadow, /etc/sudoers, etc.)..."
+    exec sudo "$0" "$@"
+fi
+
+MOUNT_POINT="/mnt/backup"
+REPO="${MOUNT_POINT}/workstation"
+PASS_FILE="/mnt/secrets/restic.pass"
+
+if ! mountpoint -q "$MOUNT_POINT"; then
+    echo "error: backup drive not mounted — run: backup-open" >&2
+    exit 1
+fi
+
+if [ ! -f "$PASS_FILE" ]; then
+    echo "error: restic password file not found at ${PASS_FILE}" >&2
+    exit 1
+fi
+
+export RESTIC_REPOSITORY="$REPO"
+export RESTIC_PASSWORD_FILE="$PASS_FILE"
+
+echo "=== Workstation backup — $(date '+%Y-%m-%d %H:%M:%S') ==="
+
+restic backup \
+    /mnt/source \
+    /mnt/secrets \
+    /etc \
+    --exclude='node_modules' \
+    --exclude='.cache' \
+    --exclude='__pycache__' \
+    --exclude='*.pyc' \
+    --exclude='target/debug' \
+    --exclude='target/release' \
+    --exclude='.mise/installs' \
+    --one-file-system \
+    --verbose
+
+echo ""
+echo "=== Pruning old snapshots ==="
+restic forget \
+    --keep-daily 7 \
+    --keep-weekly 4 \
+    --keep-monthly 3 \
+    --prune
+
+echo ""
+echo "=== Snapshot summary ==="
+restic snapshots
+
+echo ""
+echo "=== Done — run: backup-close ==="

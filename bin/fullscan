@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# fullscan — complete filesystem security scan
+# Run before pushing code to other machines, overnight, or before major deployments.
+# Scans everything. Only excludes compiled build output and pseudo-filesystems.
+# Expect this to take several hours on a full system.
+
+set -euo pipefail
+# shellcheck source=../lib/syscheck.sh
+source "$(dirname "$(readlink -f "$0")")/../lib/syscheck.sh"
+# shellcheck disable=SC2034  # read by progress() in syscheck.sh
+TOTAL_STEPS=4
+init_log fullscan
+
+echo -e "\n${BOLD}${CYAN}╔══════════════════════════════════════════╗"
+echo -e "║  FULL SCAN — $(date '+%Y-%m-%d %H:%M')            ║"
+echo -e "║  This will take several hours.           ║"
+echo -e "╚══════════════════════════════════════════╝${RESET}\n"
+
+# Derived build output — safe to skip (produced from source already on disk)
+# Pseudo-filesystems — not real files
+CLAM_EXCLUDES=(
+  --exclude-dir=".git/objects"
+  --exclude-dir="target"        # Rust/Cargo build output
+  --exclude-dir="dist"          # JS/Python build output
+  --exclude-dir="__pycache__"
+  --exclude-dir=".mypy_cache"
+  --exclude-dir=".pytest_cache"
+)
+
+# ── 1. Rkhunter (verbose) ─────────────────────────────────────────────────────
+progress "Rootkit scan (rkhunter — full)"
+
+if ! command -v rkhunter &>/dev/null; then
+  warn "rkhunter not installed"
+else
+  echo -e "  ${DIM}Running full scan...${RESET}"
+  RKH_OUT=$(sudo rkhunter --check --skip-keypress --report-warnings-only 2>&1) || true
+  WARNINGS=$(echo "$RKH_OUT" | grep -E "^\[ *Warning\]|Warning:" || true)
+  if [[ -z "$WARNINGS" ]]; then
+    ok "No warnings"
+  else
+    while IFS= read -r line; do warn "rkhunter: $line"; done <<< "$WARNINGS"
+    note "rkhunter warnings found — run: sudo rkhunter --check for full details"
+  fi
+fi
+
+# ── 2. Chkrootkit ─────────────────────────────────────────────────────────────
+progress "Rootkit scan (chkrootkit)"
+
+if ! command -v chkrootkit &>/dev/null; then
+  warn "chkrootkit not installed"
+else
+  echo -e "  ${DIM}Scanning...${RESET}"
+  CRK_OUT=$(sudo chkrootkit 2>&1) || true
+  INFECTED=$(echo "$CRK_OUT" | grep -i "INFECTED" || true)
+  if [[ -z "$INFECTED" ]]; then
+    ok "No infections found"
+  else
+    while IFS= read -r line; do err "chkrootkit: $line"; done <<< "$INFECTED"
+    note "chkrootkit found infections — do NOT push code until resolved"
+  fi
+fi
+
+# ── 3. ClamAV — full filesystem ───────────────────────────────────────────────
+progress "Malware scan (clamscan — full filesystem)"
+
+if ! command -v clamscan &>/dev/null; then
+  warn "clamscan not installed — install clamav"
+else
+  echo -e "  ${DIM}Scanning full filesystem (this is the slow part)...${RESET}"
+  echo -e "  ${DIM}Excludes: compiled build output (.git/objects, target, dist, __pycache__)${RESET}"
+  echo -e "  ${DIM}Includes: ~/.cache, node_modules, downloads, AUR build cache — everything else${RESET}\n"
+
+  CLAM_OUT=$(clamscan -r --quiet --infected \
+    "${CLAM_EXCLUDES[@]}" \
+    /etc /tmp /var/tmp \
+    "$HOME" \
+    2>/dev/null) || true
+
+  if [[ -z "$CLAM_OUT" ]]; then
+    ok "No threats found"
+  else
+    while IFS= read -r line; do err "clamscan: $line"; done <<< "$CLAM_OUT"
+    note "ClamAV found threats — do NOT push code until resolved"
+  fi
+fi
+
+# ── 4. AIDE full integrity check ──────────────────────────────────────────────
+progress "File integrity (AIDE — full)"
+
+if ! command -v aide &>/dev/null; then
+  warn "aide not installed"
+elif [[ ! -f /var/lib/aide/aide.db.gz ]]; then
+  warn "AIDE database not initialised — run: sudo aide --init"
+else
+  echo -e "  ${DIM}Running full integrity check...${RESET}"
+  AIDE_OUT=$(sudo aide --check 2>&1) || true
+  CHANGES=$(echo "$AIDE_OUT" | grep -E "^(Added|Removed|Changed|f\+)" || true)
+  CHANGE_COUNT=$(echo "$CHANGES" | grep -c . || true)
+  if [[ -z "$CHANGES" ]]; then
+    ok "No integrity violations"
+  else
+    warn "$CHANGE_COUNT integrity change(s) detected:"
+    echo "$CHANGES" | head -30 | sed 's/^/    /'
+    [[ $CHANGE_COUNT -gt 30 ]] && echo -e "  ${DIM}... and $((CHANGE_COUNT - 30)) more. Run: sudo aide --check for full report${RESET}"
+    note "AIDE detected $CHANGE_COUNT filesystem change(s) — review before pushing"
+  fi
+fi
+
+summary
+
+echo -e "${DIM}Tip: run this overnight before major deployments.${RESET}"
+echo -e "${DIM}If threats found: do NOT connect to external systems until resolved.${RESET}\n"

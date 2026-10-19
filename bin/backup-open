@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# backup-open — unlock and mount the backup drive
+# Usage: backup-open [device]
+# Device defaults to /dev/disk/by-uuid/$BACKUP_UUID
+
+set -euo pipefail
+
+MAPPER_NAME="backup"
+MOUNT_POINT="/mnt/backup"
+
+# Allow override for portability (e.g. backup-open /dev/sdb)
+DEVICE="${1:-/dev/disk/by-uuid/${BACKUP_UUID:?set BACKUP_UUID or pass a device}}"
+
+if [ ! -e "$DEVICE" ]; then
+    echo "error: backup drive not found (is it plugged in?)" >&2
+    exit 1
+fi
+
+if [ -e "/dev/mapper/${MAPPER_NAME}" ]; then
+    echo "already open at /dev/mapper/${MAPPER_NAME}"
+else
+    echo "unlocking backup drive..."
+    sudo cryptsetup open "$DEVICE" "$MAPPER_NAME"
+fi
+
+sudo mkdir -p "$MOUNT_POINT"
+
+if mountpoint -q "$MOUNT_POINT"; then
+    echo "already mounted at ${MOUNT_POINT}"
+else
+    sudo mount /dev/mapper/"${MAPPER_NAME}" "$MOUNT_POINT"
+    sudo chown "$USER:$(id -gn)" "$MOUNT_POINT"
+    echo "backup drive mounted at ${MOUNT_POINT}"
+fi

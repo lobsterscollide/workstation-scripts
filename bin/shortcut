@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""shortcut — print all Hyprland keybindings, grouped by section."""
+
+import os
+import re
+from pathlib import Path
+
+# ── Terminal colours ──────────────────────────────────────────────────────────
+BOLD  = "\033[1m"
+DIM   = "\033[2m"
+CYAN  = "\033[36m"
+WHITE = "\033[97m"
+RESET = "\033[0m"
+
+# ── Config files, in load order (later files override earlier ones) ────────────
+HOME = Path.home()
+CONF_FILES = [
+    HOME / ".local/share/omarchy/default/hypr/bindings/tiling-v2.conf",
+    HOME / ".local/share/omarchy/default/hypr/bindings/utilities.conf",
+    HOME / ".local/share/omarchy/default/hypr/bindings/media.conf",
+    HOME / ".local/share/omarchy/default/hypr/bindings/clipboard.conf",
+    HOME / ".config/hypr/bindings.conf",
+]
+
+# ── Key display names ─────────────────────────────────────────────────────────
+KEY_NAMES = {
+    "return": "Enter", "space": "Space", "tab": "Tab", "escape": "Esc",
+    "backspace": "Backspace", "delete": "Delete", "print": "Print Scr",
+    "comma": ",", "period": ".", "slash": "/",
+    "code:10": "1", "code:11": "2", "code:12": "3", "code:13": "4",
+    "code:14": "5", "code:15": "6", "code:16": "7", "code:17": "8",
+    "code:18": "9", "code:19": "0", "code:20": "-", "code:21": "=",
+    "left": "←", "right": "→", "up": "↑", "down": "↓",
+    "xf86audioraisevolume": "Vol ↑", "xf86audiolowervolume": "Vol ↓",
+    "xf86audiomute": "Mute", "xf86audiomicmute": "Mic Mute",
+    "xf86monbrightnessup": "Bright ↑", "xf86monbrightnessdown": "Bright ↓",
+    "xf86audionext": "Next Track", "xf86audiopause": "Pause",
+    "xf86audioplay": "Play", "xf86audioprev": "Prev Track",
+    "xf86poweroff": "Power", "xf86calculator": "Calculator",
+    "mouse:272": "Left Click", "mouse:273": "Right Click",
+    "mouse_down": "Scroll ↓", "mouse_up": "Scroll ↑",
+}
+
+MOD_ORDER = ["SUPER", "CTRL", "SHIFT", "ALT"]
+MOD_NAMES = {"SUPER": "Super", "CTRL": "Ctrl", "SHIFT": "Shift", "ALT": "Alt"}
+
+BIND_RE = re.compile(
+    r"^bind\w*\s*=\s*"         # bind keyword
+    r"([^,]*),\s*"              # modifiers
+    r"([^,]+),\s*"              # key
+    r"([^,]+)",                 # description
+    re.IGNORECASE,
+)
+
+# ── Patterns to collapse into a single representative row ─────────────────────
+COLLAPSE_PATTERNS = [
+    (re.compile(r"Switch to workspace \d+"),       "Super + [1-9, 0]",            "Switch to workspace"),
+    (re.compile(r"Move window to workspace \d+"),  "Super + Shift + [1-9, 0]",    "Move window to workspace"),
+    (re.compile(r"Move window silently"),          "Super + Shift + Alt + [1-9, 0]", "Move window silently to workspace"),
+    (re.compile(r"Switch to group window \d+"),    "Super + Alt + [1-9, 0]",      "Switch to group window"),
+]
+
+# Section headings to rewrite (substring match → replacement)
+SECTION_REWRITES = [
+    ("Switch workspaces with",          "Workspaces"),
+    ("Move active window to a workspace", "Move window to workspace"),
+    ("Move active window silently",     "Move window to workspace (silent)"),
+    ("Swap active window with",         "Swap windows"),
+    ("Scroll through existing",         "Scroll workspaces"),
+    ("Scroll through a set of grouped", "Scroll group windows"),
+    ("Move/resize windows with",        "Mouse — move & resize"),
+    ("Navigate a single set of grouped","Navigate group windows"),
+    ("Window navigation for grouped",   "Group window navigation"),
+    ("Activate window in a group",      "Jump to group window"),
+    ("Laptop multimedia keys",          "Volume & brightness"),
+    ("Precise 1%",                      "Volume & brightness (precise)"),
+    ("Requires playerctl",              "Media playback"),
+    ("Switch audio output with",        "Audio output"),
+    ("Move focus with",                 "Move focus"),
+    ("TAB between workspaces",          "Cycle workspaces"),
+    ("Move workspaces to other",        "Move workspace to monitor"),
+    ("If your web app",                 "Web apps"),
+    ("Cycle through applications",      "Cycle windows"),
+    ("Resize active window",            "Resize window"),
+    ("Waybar-less information",         "Quick info"),
+    ("Control Apple Display",           "Apple Display brightness"),
+    ("Toggle groups",                   "Window groups"),
+    ("Join groups",                     "Join groups"),
+]
+
+
+def rewrite_section(name: str) -> str:
+    for fragment, replacement in SECTION_REWRITES:
+        if fragment.lower() in name.lower():
+            return replacement
+    return name
+
+
+def format_key(mods_raw: str, key_raw: str) -> str:
+    mods = [m.strip() for m in mods_raw.strip().split() if m.strip()]
+    ordered = [m for m in MOD_ORDER if m in mods]
+    parts = [MOD_NAMES.get(m, m) for m in ordered]
+    key = key_raw.strip()
+    parts.append(KEY_NAMES.get(key.lower(), key.upper() if len(key) == 1 else key.title()))
+    return " + ".join(parts)
+
+
+def parse_file(path: Path):
+    """Return list of (section, keybinding_str, description) tuples."""
+    if not path.exists():
+        return []
+
+    entries = []
+    current_section = path.stem.replace("-", " ").title()
+
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip()
+
+            # Section comment
+            stripped = line.lstrip()
+            if stripped.startswith("#") and not stripped.startswith("##"):
+                heading = stripped.lstrip("#").strip()
+                if heading:
+                    current_section = rewrite_section(heading)
+                continue
+
+            m = BIND_RE.match(stripped)
+            if not m:
+                continue
+
+            mods, key, desc = m.group(1), m.group(2).strip(), m.group(3).strip()
+            keybind = format_key(mods, key)
+            entries.append((current_section, keybind, desc))
+
+    return entries
+
+
+def collapse(entries):
+    """Replace repetitive workspace/group rows with a single summary row."""
+    seen_collapsed = set()
+    result = []
+    for section, keybind, desc in entries:
+        matched = False
+        for pattern, collapsed_key, collapsed_desc in COLLAPSE_PATTERNS:
+            if pattern.match(desc):
+                if collapsed_desc not in seen_collapsed:
+                    result.append((section, collapsed_key, collapsed_desc))
+                    seen_collapsed.add(collapsed_desc)
+                matched = True
+                break
+        if not matched:
+            result.append((section, keybind, desc))
+    return result
+
+
+def group_by_section(entries):
+    sections = {}
+    order = []
+    for section, keybind, desc in entries:
+        if section not in sections:
+            sections[section] = []
+            order.append(section)
+        sections[section].append((keybind, desc))
+    return order, sections
+
+
+def print_shortcuts():
+    all_entries = []
+    for conf in CONF_FILES:
+        all_entries.extend(parse_file(conf))
+
+    all_entries = collapse(all_entries)
+    order, sections = group_by_section(all_entries)
+
+    # Measure widest keybinding for alignment
+    max_key_len = max((len(k) for _, k, _ in all_entries), default=20)
+    col_width = max_key_len + 2
+
+    term_width = os.get_terminal_size().columns if os.isatty(1) else 80
+    bar = "─" * min(term_width, 72)
+
+    print()
+    print(f"{BOLD}{CYAN}  SHORTCUTS{RESET}")
+    print(f"{DIM}  {bar}{RESET}")
+
+    for section in order:
+        rows = sections[section]
+        print()
+        print(f"{BOLD}{WHITE}  {section}{RESET}")
+        for keybind, desc in rows:
+            padding = col_width - len(keybind)
+            print(f"    {CYAN}{keybind}{RESET}{' ' * padding}{DIM}{desc}{RESET}")
+
+    print()
+
+
+if __name__ == "__main__":
+    print_shortcuts()
